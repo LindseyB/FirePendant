@@ -1,11 +1,9 @@
 //--------------------------------------------------------------------------
-// Animated flame for Adafruit Pro Trinket.  Uses the following parts:
-//   - Pro Trinket microcontroller (adafruit.com/product/2010 or 2000)
-//     (#2010 = 3V/12MHz for longest battery life, but 5V/16MHz works OK)
+// Animated flame for Adafruit Feather M0.  Uses the following parts:
+//   - Adafruit Feather M0
 //   - Charlieplex LED Matrix Driver (2946)
 //   - Charlieplex LED Matrix (2947, 2948, 2972, 2973 or 2974)
 //   - 350 mAh LiPoly battery (2750)
-//   - LiPoly backpack (2124)
 //   - SPDT Slide Switch (805)
 //
 // This is NOT good "learn from" code for the IS31FL3731; it is "squeeze
@@ -17,14 +15,15 @@
 
 #include <Wire.h>           // For I2C communication
 #include "data.h"           // Flame animation data
-#include <avr/power.h>      // Peripheral control and
-#include <avr/sleep.h>      // sleep to minimize current draw
 
 #define I2C_ADDR 0x74       // I2C address of Charlieplex matrix
+#define GAMMA 2.5
 
 uint8_t        page = 0;    // Front/back buffer control
 const uint8_t *ptr  = anim; // Current pointer into animation data
 uint8_t        img[9 * 16]; // Buffer for rendering image
+uint8_t        gamma8[256]; // Gamma correction table
+
 
 // UTILITY FUNCTIONS -------------------------------------------------------
 
@@ -34,10 +33,11 @@ uint8_t        img[9 * 16]; // Buffer for rendering image
 // Adafruit_GFX libraries if you need to do actual graphics stuff.
 
 // Begin I2C transmission and write register address (data then follows)
-void writeRegister(uint8_t n) {
+uint8_t writeRegister(uint8_t n) {
   Wire.beginTransmission(I2C_ADDR);
   Wire.write(n);
   // Transmission is left open for additional writes
+  return 2;
 }
 
 // Select one of eight IS31FL3731 pages, or Function Registers
@@ -50,61 +50,35 @@ void pageSelect(uint8_t n) {
 // SETUP FUNCTION - RUNS ONCE AT STARTUP -----------------------------------
 
 void setup() {
-  uint8_t i, p, byteCounter;
+  uint16_t i;
+  uint8_t  p, bytes;
 
-  power_all_disable(); // Stop peripherals: ADC, timers, etc. to save power
-  power_twi_enable();  // But switch I2C back on; need it for display
-  DIDR0 = 0x0F;        // Digital input disable on A0-A3
+  Wire.begin();
+  Wire.setClock(400000L);
 
-  // The Arduino Wire library runs I2C at 100 KHz by default.
-  // IS31FL3731 can run at 400 KHz.  To ensure fast animation,
-  // override the I2C speed settings after init...
-  Wire.begin();                            // Initialize I2C
-  TWSR = 0;                                // I2C prescaler = 1
-  TWBR = (F_CPU / 400000 - 16) / 2;        // 400 KHz I2C
-  // The TWSR/TWBR lines are AVR-specific and won't work on other MCUs.
-
+  // Initialize IS31FL3731 directly (no library)
   pageSelect(0x0B);                        // Access the Function Registers
   writeRegister(0);                        // Starting from first...
   for(i=0; i<13; i++) Wire.write(10 == i); // Clear all except Shutdown
   Wire.endTransmission();
   for(p=0; p<2; p++) {                     // For each page used (0 & 1)...
     pageSelect(p);                         // Access the Frame Registers
-    writeRegister(0);                      // Start from 1st LED control reg
-    for(i=0; i<18; i++) Wire.write(0xFF);  // Enable all LEDs (18*8=144)
-    for(byteCounter = i+1; i<0xB4; i++) {  // For blink & PWM registers...
-      Wire.write(0);                       // Clear all
-      if(++byteCounter >= 32) {            // Every 32 bytes...
-        byteCounter = 1;                   // End I2C transmission and
-        Wire.endTransmission();            // start a new one because
-        writeRegister(i);                  // Wire buf is only 32 bytes.
-      }
+    for(bytes=i=0; i<180; i++) {           // For each register...
+      if(!bytes) bytes = writeRegister(i); // Buf empty? Start xfer @ reg i
+      Wire.write(0xFF * (i < 18));         // 0-17 = enable, 18+ = blink+PWM
+      if(++bytes >= SERIAL_BUFFER_SIZE) bytes = Wire.endTransmission();
     }
-    Wire.endTransmission();
+    if(bytes) Wire.endTransmission();      // Write any data left in buffer
   }
-
-  // Enable the watchdog timer, set to a ~32 ms interval (about 31 Hz)
-  // This provides a sufficiently steady time reference for animation,
-  // allows timer/counter peripherals to remain off (for power saving)
-  // and can power-down the chip after processing each frame.
-  set_sleep_mode(SLEEP_MODE_PWR_DOWN); // Deepest sleep mode (WDT wakes)
-  noInterrupts();
-  MCUSR  &= ~_BV(WDRF);
-  WDTCSR  =  _BV(WDCE) | _BV(WDE);     // WDT change enable
-  WDTCSR  =  _BV(WDIE) | _BV(WDP0);    // Interrupt enable, ~32 ms
-  interrupts();
-  // Peripheral and sleep savings only amount to about 10 mA, but this
-  // may provide nearly an extra hour of run time before battery depletes.
+ 
+  for(i=0; i<256; i++) // Initialize gamma-correction table:
+    gamma8[i] = (uint8_t)(pow(((float)i / 255.0), GAMMA) * 255.0 + 0.5);
 }
 
 // LOOP FUNCTION - RUNS EVERY FRAME ----------------------------------------
 
 void loop() {
   uint8_t  a, x1, y1, x2, y2, x, y;
-
-  power_twi_enable();
-  // Datasheet recommends that I2C should be re-initialized after enable,
-  // but Wire.begin() is slow.  Seems to work OK without.
 
   // Display frame rendered on prior pass.  This is done at function start
   // (rather than after rendering) to ensire more uniform animation timing.
@@ -146,13 +120,4 @@ void loop() {
     }
   }
   Wire.endTransmission();
-
-  power_twi_disable(); // I2C off (see comment at top of function)
-  sleep_enable();
-  interrupts();
-  sleep_mode();        // Power-down MCU.
-  // Code will resume here on wake; loop() returns and is called again
 }
-
-ISR(WDT_vect) { } // Watchdog timer interrupt (does nothing, but required)
-
